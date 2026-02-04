@@ -7,13 +7,18 @@ class WCKX_OrderSync {
         $send_on = isset($opts['send_on']) ? $opts['send_on'] : 'thankyou';
 
         if ($send_on === 'thankyou') {
-            add_action('woocommerce_thankyou', [__CLASS__, 'handle_order'], 20, 1);
+            add_action('woocommerce_thankyou', [__CLASS__, 'queue_order_export'], 20, 1);
+        } elseif ($send_on === 'payment_complete') {
+            add_action('woocommerce_payment_complete', [__CLASS__, 'queue_order_export'], 20, 1);
         }
+
         add_filter('woocommerce_admin_order_actions', [__CLASS__, 'add_admin_action'], 10, 2);
         add_action('admin_action_wckx_send_order', [__CLASS__, 'manual_send_action']);
-
         add_action('woocommerce_order_actions', [__CLASS__, 'register_order_action']);
         add_action('woocommerce_order_action_wckx_send_order', [__CLASS__, 'order_edit_action_handler']);
+
+        // Worker for async job
+        add_action('wckx_export_order', [__CLASS__, 'send_order'], 10, 1);
     }
 
     public static function add_admin_action($actions, $order) {
@@ -33,25 +38,47 @@ class WCKX_OrderSync {
     }
 
     public static function order_edit_action_handler($order) {
-        if (is_a($order, 'WC_Order')) self::send_order($order->get_id());
+        if (is_a($order, 'WC_Order')) {
+            if (function_exists('as_enqueue_async_action')) {
+                as_enqueue_async_action('wckx_export_order', ['order_id' => (int)$order->get_id()], 'wckx');
+            } else {
+                self::send_order($order->get_id());
+            }
+        }
     }
 
     public static function manual_send_action() {
         if (!current_user_can('manage_woocommerce')) wp_die(__('Access denied', 'wc-kornitx-bridge'));
         check_admin_referer('wckx_send_order');
         $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
-        if ($order_id) self::send_order($order_id);
+        if ($order_id) {
+            if (function_exists('as_enqueue_async_action')) {
+                as_enqueue_async_action('wckx_export_order', ['order_id' => (int)$order_id], 'wckx');
+            } else {
+                self::send_order($order_id);
+            }
+        }
         wp_safe_redirect(wp_get_referer() ?: admin_url('admin.php?page=wc-orders'));
         exit;
     }
 
-    public static function handle_order($order_id) { self::send_order($order_id); }
+    public static function queue_order_export($order_id) {
+        if (!$order_id) return;
+        $order = wc_get_order($order_id);
+        if (!$order) return;
+        if ((bool) $order->get_meta('_wckx_sent')) return; // avoid duplicates
+
+        if (function_exists('as_enqueue_async_action')) {
+            as_enqueue_async_action('wckx_export_order', ['order_id' => (int)$order_id], 'wckx');
+        } else {
+            self::send_order($order_id);
+        }
+    }
 
     public static function send_order($order_id) {
         $order = wc_get_order($order_id);
         if (!$order) return;
-
-        if ((bool) $order->get_meta('_wckx_sent')) return; // Avoid duplicate sends
+        if ((bool) $order->get_meta('_wckx_sent')) return; // idempotency
 
         $payload = self::serialize_order($order);
         $resp    = WCKX_Helpers::post('/order', $payload);
@@ -67,12 +94,18 @@ class WCKX_OrderSync {
         } else {
             $order->add_order_note(__('Kornit X push failed. See Kornit X Bridge Logs.', 'wc-kornitx-bridge'));
             WCKX_Helpers::log_event('Order send failed', ['order_id' => $order_id, 'resp' => $resp]);
+
+            // If called by the async worker and transient, throw to allow retry
+            if (did_action('wckx_export_order') && !empty($resp['transient'])) {
+                throw new Exception('Transient error sending order to Kornit X');
+            }
         }
     }
 
     private static function serialize_order($order) {
         $opts = get_option(WCKX_OPTION_NAME, []);
-        $sale_dt           = $order->get_date_created();
+
+        $sale_dt = $order->get_date_created();
         $sale_datetime_utc = $sale_dt ? gmdate('Y-m-d H:i:s', $sale_dt->getTimestamp()) : gmdate('Y-m-d H:i:s');
 
         $ship = $order->get_address('shipping');
@@ -85,15 +118,21 @@ class WCKX_OrderSync {
 
         $items = [];
         foreach ($order->get_items() as $item) {
-            $product = $item->get_product();
-            $pod_ref = $product ? get_post_meta($product->get_id(), '_wckx_pod_ref', true) : '';
+            $product  = $item->get_product();
+            $pod_ref  = $product ? get_post_meta($product->get_id(), '_wckx_pod_ref', true) : '';
+            $qty      = (int) $item->get_quantity();
+
+            // Unit prices (ex/incl tax)
+            $unit_ex  = (float) $order->get_item_total($item, false, false);
+            $unit_inc = (float) $order->get_item_total($item, true,  false);
+
             $items[] = [
                 'external_ref'        => (string) $item->get_id(),
-                'sku'                 => $product ? $product->get_sku() : '',
-                'description'         => $item->get_name(),
-                'quantity'            => (int) $item->get_quantity(),
-                'sale_price'          => (float) $order->get_item_subtotal($item, true),
-                'sale_price_inc_tax'  => (float) $order->get_line_total($item, true),
+                'sku'                 => $product ? (string) $product->get_sku() : '',
+                'description'         => (string) $item->get_name(),
+                'quantity'            => $qty,
+                'sale_price'          => $unit_ex,
+                'sale_price_inc_tax'  => $unit_inc,
                 'type'                => 3,
                 'print_on_demand_ref' => $pod_ref ?: '',
             ];
@@ -113,28 +152,28 @@ class WCKX_OrderSync {
             'company_ref_id'         => (int) ($opts['kornit_company_ref_id'] ?? 0),
             'sale_datetime'          => $sale_datetime_utc,
             'customer_name'          => $customer_name,
-            'customer_email'         => $order->get_billing_email(),
-            'customer_telephone'     => $order->get_billing_phone(),
-            'shipping_company'       => $ship['company'] ?? '',
-            'shipping_address_1'     => $ship['address_1'] ?? '',
-            'shipping_address_2'     => $ship['address_2'] ?? '',
+            'customer_email'         => (string) $order->get_billing_email(),
+            'customer_telephone'     => (string) $order->get_billing_phone(),
+            'shipping_company'       => $ship['company']  ?? '',
+            'shipping_address_1'     => $ship['address_1']?? '',
+            'shipping_address_2'     => $ship['address_2']?? '',
             'shipping_address_3'     => '',
-            'shipping_address_4'     => $ship['city'] ?? '',
-            'shipping_address_5'     => $ship['state'] ?? '',
+            'shipping_address_4'     => $ship['city']     ?? '',
+            'shipping_address_5'     => $ship['state']    ?? '',
             'shipping_postcode'      => $ship['postcode'] ?? '',
-            'shipping_country_code'  => $ship['country'] ?? '',
+            'shipping_country_code'  => $ship['country']  ?? '',
             'shipping_method'        => $shipping_method,
-            'billing_company'        => $bill['company'] ?? '',
-            'billing_address_1'      => $bill['address_1'] ?? '',
-            'billing_address_2'      => $bill['address_2'] ?? '',
+            'billing_company'        => $bill['company']  ?? '',
+            'billing_address_1'      => $bill['address_1']?? '',
+            'billing_address_2'      => $bill['address_2']?? '',
             'billing_address_3'      => '',
-            'billing_address_4'      => $bill['city'] ?? '',
-            'billing_address_5'      => $bill['state'] ?? '',
+            'billing_address_4'      => $bill['city']     ?? '',
+            'billing_address_5'      => $bill['state']    ?? '',
             'billing_postcode'       => $bill['postcode'] ?? '',
-            'billing_country'        => $bill['country'] ?? '',
+            'billing_country'        => $bill['country']  ?? '',
             'shipping_price'         => (float) $order->get_shipping_total(),
             'shipping_price_inc_tax' => (float) ($order->get_shipping_total() + $order->get_shipping_tax()),
-            'currency_code'          => $order->get_currency(),
+            'currency_code'          => (string) $order->get_currency(),
             'items'                  => $items,
         ];
     }
