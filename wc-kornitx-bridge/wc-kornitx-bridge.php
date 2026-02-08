@@ -1,51 +1,40 @@
 <?php
 /**
- * Plugin Name: WC Kornit X Bridge
- * Description: Sends WooCommerce orders to Kornit X (Create Orders API) and provides basic status/logs.
- * Version: 0.2.7a
- * Author: Your Team
- * Text Domain: wc-kornitx-bridge
+ * Plugin Name: KornitX Bridge for WooCommerce
+ * Description: Smartlink iFrame + postMessage bridge (Type 2 print job), variation mapping, thumbnails, edit link, and Create Orders API submission.
+ * Version: 0.2.9d
+ * Author: Paul Sutton + Copilot
+ * Requires at least: 6.1
+ * Requires PHP: 7.4
+ * WC requires at least: 7.0
+ * WC tested up to: 9.3
+ * License: GPLv2 or later
  */
 
-if ( ! defined('ABSPATH') ) exit;
+if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-if ( ! defined('WCKX_PATH') ) define('WCKX_PATH', plugin_dir_path(__FILE__));
-if ( ! defined('WCKX_URL') )  define('WCKX_URL',  plugin_dir_url(__FILE__));
-if ( ! defined('WCKX_OPTION_GROUP') ) define('WCKX_OPTION_GROUP', 'wckx_settings');
-if ( ! defined('WCKX_OPTION_NAME') )  define('WCKX_OPTION_NAME',  'wckx_settings');
-if ( ! defined('WCKX_LOG_OPTION') )   define('WCKX_LOG_OPTION',   'wckx_logs');
+// Constants
+if ( ! defined( 'KX_WC_VERSION' ) ) define( 'KX_WC_VERSION', '0.2.9d' );
+if ( ! defined( 'KX_WC_FILE' ) ) define( 'KX_WC_FILE', __FILE__ );
+if ( ! defined( 'KX_WC_DIR' ) ) define( 'KX_WC_DIR', plugin_dir_path( __FILE__ ) );
+if ( ! defined( 'KX_WC_URL' ) ) define( 'KX_WC_URL', plugin_dir_url( __FILE__ ) );
+if ( ! defined( 'KX_WC_SMARTLINK_ORIGIN' ) ) define( 'KX_WC_SMARTLINK_ORIGIN', 'https://g3d-app.com' );
 
-register_activation_hook(__FILE__, function(){
-    if ( false === get_option(WCKX_OPTION_NAME, false) ) {
-        add_option(WCKX_OPTION_NAME, [], '', 'no'); // do not autoload secrets
-    }
-    if ( false === get_option(WCKX_LOG_OPTION, false) ) {
-        add_option(WCKX_LOG_OPTION, [], '', 'no'); // do not autoload logs
-    }
-});
+// Includes
+require_once KX_WC_DIR . 'includes/helpers.php';
+require_once KX_WC_DIR . 'includes/class-kx-settings.php';
+require_once KX_WC_DIR . 'includes/class-kx-admin-product.php';
+require_once KX_WC_DIR . 'includes/class-kx-variant-resolver.php';
+require_once KX_WC_DIR . 'includes/class-kx-frontend.php';
+require_once KX_WC_DIR . 'includes/class-kx-order.php';
+require_once KX_WC_DIR . 'includes/class-kx-debug.php';
 
-add_action('plugins_loaded', function(){
-    if ( ! class_exists('WooCommerce') ) {
-        add_action('admin_notices', function(){
-            echo '<div class="notice notice-error"><p>'
-               . esc_html__('WC Kornit X Bridge requires WooCommerce to be active.','wc-kornitx-bridge')
-               . '</p></div>';
-        });
-        return;
-    }
-
-    require_once WCKX_PATH.'includes/Helpers.php';
-    require_once WCKX_PATH.'includes/OrderSync.php';
-    require_once WCKX_PATH.'includes/ProductPodMeta.php';
-    require_once WCKX_PATH.'includes/StatusUi.php';
-    require_once WCKX_PATH.'includes/HposUi.php';
-    require_once WCKX_PATH.'admin/Settings.php';
-    require_once WCKX_PATH.'admin/Logs.php';
-
-    WCKX_Settings::init();
-    WCKX_ProductPodMeta::init();
-    WCKX_OrderSync::init();
-    WCKX_StatusUi::init();
-    WCKX_HposUi::init();
-    WCKX_Logs::init();
+// Bootstrap
+add_action( 'plugins_loaded', function(){
+    \KX_WC\Settings::init();
+    \KX_WC\Admin_Product::init();
+    \KX_WC\Variant_Resolver::init();
+    \KX_WC\Frontend::init();
+    \KX_WC\Order::init();
+    \KX_WC\Debug::init();
 });
